@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-psychoacoustic_upmixer_advanced.py
+psychoacoustic_upmixer_advanced_expanded.py
 
-A single-file Python script implementing a Psychoacoustic Upmixer with:
+An advanced, single-file Python script for a Psychoacoustic Upmixer that leverages:
   - Pydantic-based configuration & validation
-  - Minimal gating-based denoising pre-processing (vectorized)
+  - Vectorized minimal gating-based denoising
   - Vectorized STFT-based operations (default n_fft=2048, Hann window)
-  - Vectorized multi-band & single-band compression
-  - Basic placeholders for advanced psychoacoustic features (stubs):
-      * Harmonic reconstruction
-      * Transient shaping
-      * Spectral EQ
-      * Advanced VBAP (example with speaker triplets)
-      * Iterative phase approach (placeholder)
-  - Basic reverb convolution (optional)
+  - Vectorized multi-band & single-band compression, lookahead limiting
+  - Expanded placeholders for advanced psychoacoustic features:
+       * Harmonic Reconstruction (with approximate F0-based partial boosting)
+       * Transient Shaping (onset detection & gain envelope)
+       * Spectral EQ (basic tilt or parametric-like approach)
+       * Advanced VBAP (Delaunay triangulation example, easily extended for 3D/HRTF-based panning)
+       * Iterative Phase Approach (Griffin-Lim style stub)
+  - Basic reverb IR convolution
   - Optional multi-band decorrelation
-  - Vectorized lookahead limiting
   - Plugin architecture for extensibility
 
-Usage:
-  python psychoacoustic_upmixer_advanced.py --stems <list_of_stems> --output out.wav
-                                           [--params key=val ...]
-                                           [--config_file myconfig.yaml/json]
-                                           [--plot_analysis]
+Usage Example:
+  python psychoacoustic_upmixer_advanced_expanded.py --stems vocal.wav drums.wav bass.wav other.wav \
+                                                     --output upmixed_output.wav \
+                                                     [--config_file myconfig.yaml/json] \
+                                                     [--params key=val ...] \
+                                                     [--plot_analysis]
 
 Note:
-  - The script is designed for offline usage. Real-time operation would require
-    block-based processing and state management.
-  - The advanced psychoacoustic stubs (harmonic reconstruction, etc.) provide
-    examples of where and how to expand the code. They do not contain production logic.
+  - This script remains oriented for offline usage. Real-time operation would require
+    block-based processing and more sophisticated state management.
+  - The advanced psychoacoustic placeholders (harmonic reconstruction, etc.)
+    contain conceptual logic that can be refined or replaced with more
+    robust algorithms (e.g., advanced F0 estimators, fancy onset detectors, etc.).
 """
 
 import logging
@@ -37,6 +38,7 @@ import sys
 import json
 import argparse
 import glob
+import math
 from typing import List, Tuple, Dict, Optional, Literal
 
 import torch
@@ -48,28 +50,20 @@ import yaml
 
 from pydantic import BaseModel, validator, ValidationError, Field
 from scipy.signal import butter, sosfiltfilt, correlate
+from scipy.spatial import Delaunay
 
-###############################################################################
-# Attempt advanced psychoacoustic library (nussl) if installed
-###############################################################################
 try:
-    import nussl  # for advanced masking or separation
+    import nussl  # For advanced separation/masking if needed
     HAVE_NUSSL = True
 except ImportError:
     HAVE_NUSSL = False
 
-###############################################################################
-# Logging Setup
-###############################################################################
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-###############################################################################
-# Device Setup
-###############################################################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
@@ -81,15 +75,15 @@ class UpmixerError(Exception):
     pass
 
 class ParameterError(UpmixerError):
-    """Exception for config or parameter issues."""
+    """Exception raised for configuration or parameter issues."""
     pass
 
 class FileLoadingError(UpmixerError):
-    """Exception for file loading failures."""
+    """Exception raised for file loading failures."""
     pass
 
 class PanningError(UpmixerError):
-    """Exception for VBAP or panning-related errors."""
+    """Exception raised for VBAP or panning-related errors."""
     pass
 
 ###############################################################################
@@ -97,7 +91,7 @@ class PanningError(UpmixerError):
 ###############################################################################
 class BasePlugin:
     """
-    BasePlugin for upmixer. Must implement 'process(audio)' -> audio.
+    BasePlugin for the upmixer. Must implement 'process(audio) -> audio'.
     """
     def __init__(self, params: dict = None):
         self.params = params or {}
@@ -107,7 +101,7 @@ class BasePlugin:
 
 class GainPlugin(BasePlugin):
     """
-    Example plugin: apply constant gain to the audio signal.
+    Example plugin that applies a constant gain to the audio signal.
     """
     def __init__(self, params: dict = None):
         super().__init__(params)
@@ -117,7 +111,7 @@ class GainPlugin(BasePlugin):
         return audio * self.gain
 
 ###############################################################################
-# Configuration Models (Pydantic)
+# Pydantic Configuration Models
 ###############################################################################
 class ReverbConfig(BaseModel):
     enabled: bool = False
@@ -151,7 +145,7 @@ class SpeakerLayoutConfig(BaseModel):
     def validate_speaker_positions(cls, layout):
         for ch, pos in layout.items():
             if len(pos)!=2:
-                raise ValueError(f"Channel {ch} must have 2D coords (x,y).")
+                raise ValueError(f"Channel {ch} must have [x,y] coords.")
         return layout
 
 class Config(BaseModel):
@@ -195,27 +189,23 @@ class Config(BaseModel):
     do_spectral_eq: bool = False
     do_phase_iterative: bool = False
     plugins: Dict[str,Dict] = Field(default_factory=dict)
+    target_lufs: float = Field(-23.0)
 
     @validator('centroid_high')
     def check_centroid_range(cls, v, values):
         low = values.get('centroid_low', None)
         if low is not None and v<=low:
-            raise ValueError("centroid_high must > centroid_low.")
+            raise ValueError("centroid_high must be > centroid_low.")
         return v
 
 ###############################################################################
-# PsychoacousticUpmixer
+# Main Psychoacoustic Upmixer
 ###############################################################################
 class PsychoacousticUpmixer:
     """
-    A psychoacoustic upmixer with:
-      - Minimal gating-based denoising (vectorized)
-      - Vectorized single-band & multi-band compression
-      - Placeholders for advanced psychoacoustic features (Harmonic Reconstruction, etc.)
-      - Reverb convolution
-      - Optional multi-band decorrelation
-      - Vectorized lookahead limiting
-      - Plugin architecture for extensibility
+    Main psychoacoustic upmixer class. Features advanced placeholders:
+        harmonic reconstruction, transient shaping, spectral eq, advanced VBAP,
+        iterative phase approach, reverb IR convolution, multi-band compression, etc.
     """
     def __init__(
         self,
@@ -229,7 +219,6 @@ class PsychoacousticUpmixer:
         self.sample_rate = sample_rate
         self.target_loudness = target_loudness
 
-        # Load or build config
         if config_file and os.path.isfile(config_file):
             try:
                 with open(config_file,'r') as f:
@@ -243,7 +232,6 @@ class PsychoacousticUpmixer:
         else:
             self.config = Config()
 
-        # override
         if params:
             base_dict = self.config.dict()
             for k,v in params.items():
@@ -258,28 +246,27 @@ class PsychoacousticUpmixer:
         self.plugins = []
         self.load_plugins()
 
-        # Precompute Hann window
         self._hann_window = torch.hann_window(self.config.n_fft, device=device)
-        logger.info("PsychoacousticUpmixer initialized and ready.")
+        logger.info("PsychoacousticUpmixer initialized.")
 
     def validate_channel_map(self):
         sp_layout = self.config.speaker_layout_config.layout
-        for st_name, chans in self.config.channel_map.items():
+        for stem_name, chans in self.config.channel_map.items():
             for ch in chans:
                 if ch not in sp_layout:
-                    logger.warning(f"Channel {ch} for stem '{st_name}' not in speaker layout.")
-        logger.info("Channel map validated successfully.")
+                    logger.warning(f"Channel {ch} for stem '{stem_name}' not in speaker layout.")
+        logger.info("Channel map validated.")
 
-    ###########################################################################
+    ############################################################################
     # HRTF & Reverb
-    ###########################################################################
+    ############################################################################
     def load_hrtf(self, hrtf_path: Optional[str], built_in_hrtf: str) -> torch.Tensor:
         if hrtf_path and os.path.isfile(hrtf_path):
             try:
                 wf, sr = torchaudio.load(hrtf_path)
                 if sr!=self.sample_rate:
                     logger.info(f"Resampling HRTF from {sr} -> {self.sample_rate}")
-                    wf = torchaudio.transforms.Resample(sr, self.sample_rate)(wf)
+                    wf = torchaudio.transforms.Resample(sr,self.sample_rate)(wf)
                 if wf.size(0)==1:
                     wf = wf.repeat(2,1)
                 logger.info(f"Loaded external HRTF from {hrtf_path}")
@@ -291,12 +278,13 @@ class PsychoacousticUpmixer:
     def load_built_in_hrtf(self, name: str) -> torch.Tensor:
         bdict = self.config.built_in_hrtf_options
         if name in bdict:
+            logger.info(f"Using built-in HRTF: {name}")
             return bdict[name].to(device)
         else:
-            logger.warning(f"No built-in HRTF for '{name}'. Using minimal fallback.")
+            logger.warning(f"No built-in HRTF for '{name}'. Using fallback.")
             fallback = torch.tensor([
-                [0.0,0.1,0.0,-0.1, 0.1],
-                [0.1,0.0,0.1,0.05, 0.0]
+                [0.0, 0.1, 0.0, -0.1, 0.1],
+                [0.1, 0.0, 0.1,  0.05, 0.0]
             ], device=device)
             return fallback
 
@@ -311,7 +299,7 @@ class PsychoacousticUpmixer:
             wf, sr = torchaudio.load(path)
             if sr!=self.sample_rate:
                 logger.info(f"Resampling reverb IR from {sr} -> {self.sample_rate}")
-                wf = torchaudio.transforms.Resample(sr, self.sample_rate)(wf)
+                wf = torchaudio.transforms.Resample(sr,self.sample_rate)(wf)
             return wf.to(device)
         except Exception as e:
             logger.error(f"Reverb IR load error: {e}")
@@ -335,16 +323,16 @@ class PsychoacousticUpmixer:
                 'release_ms':rls
             })
 
-    ###########################################################################
+    ############################################################################
     # Audio I/O
-    ###########################################################################
+    ############################################################################
     def load_audio(self, path: str) -> torch.Tensor:
         if not os.path.isfile(path):
-            raise FileLoadingError(f"File '{path}' not found.")
+            raise FileLoadingError(f"Audio file '{path}' not found.")
         wf, sr = torchaudio.load(path)
         if sr!=self.sample_rate:
             logger.info(f"Resample from {sr} -> {self.sample_rate}")
-            wf = torchaudio.transforms.Resample(sr, self.sample_rate)(wf)
+            wf = torchaudio.transforms.Resample(sr,self.sample_rate)(wf)
         return wf.to(device)
 
     def load_stems(self, paths: List[str]) -> Tuple[List[torch.Tensor], int]:
@@ -363,31 +351,28 @@ class PsychoacousticUpmixer:
         torchaudio.save(file_path, audio.cpu(), self.sample_rate)
         logger.info(f"Saved upmixed audio to '{file_path}'.")
 
-    ###########################################################################
+    ############################################################################
     # Minimal Gating-based Denoising (Vectorized)
-    ###########################################################################
+    ############################################################################
     def _denoise_gating(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Minimal gating approach for denoising pre-processing (vectorized).
-        Zero out channels if RMS is below a threshold.
+        Minimal gating approach using RMS threshold. If RMS < thr, zero it out.
         """
         thr_rms = 0.02
-        if audio.dim() == 1:
-            # Single-channel gating
+        if audio.dim()==1:
             rms_val = torch.sqrt(torch.mean(audio**2))
             return torch.where(rms_val < thr_rms, torch.zeros_like(audio), audio)
         else:
-            # Multi-channel gating
-            rms_per_channel = torch.sqrt(torch.mean(audio**2, dim=-1))  # (channels,)
-            mask = (rms_per_channel >= thr_rms).unsqueeze(-1)           # (channels,1)
-            return audio * mask
+            rms_ch = torch.sqrt(torch.mean(audio**2, dim=-1))
+            mask = (rms_ch>=thr_rms).unsqueeze(-1)
+            return audio*mask
 
-    ###########################################################################
+    ############################################################################
     # Phase Alignment (Stereo)
-    ###########################################################################
+    ############################################################################
     def phase_align_stems(self, stems: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Attempts to align stereo stems by cross-correlation and polarity check.
+        Basic cross-correlation based stereo alignment.
         """
         aligned = []
         for st in stems:
@@ -397,7 +382,6 @@ class PsychoacousticUpmixer:
                 lag = np.argmax(corr) - (len(left)-1)
                 right_shifted = torch.roll(right, shifts=-lag)
                 if right_shifted.abs().max()>1e-8:
-                    # Polarity check
                     if right_shifted.min() < -0.5*right_shifted.abs().max():
                         right_shifted = -right_shifted
                 aligned.append(torch.stack([left,right_shifted], dim=0))
@@ -405,9 +389,9 @@ class PsychoacousticUpmixer:
                 aligned.append(st)
         return aligned
 
-    ###########################################################################
-    # Psychoacoustic Upmix
-    ###########################################################################
+    ############################################################################
+    # Main Upmixing Pipeline
+    ############################################################################
     def psychoacoustic_upmix_stems(self, stems: List[torch.Tensor]) -> torch.Tensor:
         aligned = self.phase_align_stems(stems)
         max_len = max(st.size(-1) for st in aligned)
@@ -415,51 +399,57 @@ class PsychoacousticUpmixer:
         out_ch = max(sp_layout.keys())+1
         final_mix = torch.zeros((out_ch, max_len), device=device)
 
-        cm_keys = list(self.config.channel_map.keys())
+        stem_names = list(self.config.channel_map.keys())
         for i, st_audio in enumerate(aligned):
-            st_name = cm_keys[i] if i<len(cm_keys) else f"stem_{i}"
+            st_name = stem_names[i] if i<len(stem_names) else f"stem_{i}"
             processed = self._process_stem(st_audio, st_name, self.config.channel_map.get(st_name, []))
             final_mix = self.mix_into_final_mix(processed, final_mix, max_len)
 
-        # optional adaptation
+        # optional adaptive spatial compression
         final_mix = self.adaptive_spatial_compression(final_mix)
         # final single-band DRC
         final_mix = self.dynamic_range_compression_vectorized(final_mix)
-        # final limiter
+        # final lookahead limiting
         final_mix = self.lookahead_limit_vectorized(final_mix)
+        # final clip reduction
         final_mix = self.reduce_clipping(final_mix)
         return final_mix
 
     def _process_stem(self, stem: torch.Tensor, stem_name: str, channels: List[int]) -> torch.Tensor:
+        """
+        Applies the entire processing chain for a single stem.
+        """
         # minimal gating-based denoising
         if self.config.do_denoising:
             stem = self._denoise_gating(stem)
 
-        # placeholders - advanced psychoacoustic expansions
+        # advanced psychoacoustic expansions
         if self.config.do_harmonic_reconstruction:
             stem = self._harmonic_reconstruction(stem)
+
         if self.config.do_transient_shaping:
             stem = self._transient_shaping(stem)
 
-        # apply stereo width
+        # stereo width
         if stem.dim()==2 and stem.size(0)==2:
             stem = self.apply_stereo_width(stem, self.config.stereo_width)
 
-        # spectral centroid => panning
+        # centroid => panning
         mono_mix = stem.mean(dim=0) if stem.dim()==2 else stem
         centroid_np = mono_mix.cpu().numpy()
-        centroid_v = float(librosa.feature.spectral_centroid(
+        c_feat = librosa.feature.spectral_centroid(
             y=centroid_np,
             sr=self.sample_rate,
             n_fft=self.config.n_fft,
             hop_length=self.config.hop_length
-        ).mean())
-        pan_pos = self.map_centroid_to_pan_2d(centroid_v)
+        )
+        centroid_val = float(c_feat.mean()) if c_feat.size>0 else 0.0
+        pan_pos = self.map_centroid_to_pan_2d(centroid_val)
 
         # advanced VBAP
         st_panned = self.vbap_spatialization(stem, channels, pan_pos)
 
-        # basic psychoacoustic masking
+        # psychoacoustic masking
         st_masked = self.apply_psychoacoustic_masking(st_panned)
 
         # loudness normalization
@@ -476,7 +466,7 @@ class PsychoacousticUpmixer:
         # multi-band decorrelation
         st_decor = self.multi_band_decorrelation(st_loud)
 
-        # eq placeholder
+        # spectral EQ placeholder
         if self.config.do_spectral_eq:
             st_decor = self._spectral_shaping(st_decor, stem_name)
 
@@ -491,213 +481,144 @@ class PsychoacousticUpmixer:
         return self.reduce_clipping(st_decor)
 
     ###########################################################################
-    # Placeholders for Advanced Psychoacoustic Features
+    # Advanced Psychoacoustic Features (Expanded Placeholders)
     ###########################################################################
     def _harmonic_reconstruction(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Example stub: Synthesize or enhance harmonic partials based on F0 detection.
+        Placeholder for advanced harmonic reconstruction.
+        Here we do a simple F0-based partial boosting in the STFT domain.
         """
-        logger.debug("Starting harmonic reconstruction (stub).")
-        # Stub logic: no actual harmonic generation
-        logger.debug("Harmonic reconstruction completed (no changes).")
-        return audio
+        logger.debug("Starting harmonic reconstruction (expanded placeholder).")
+        n_fft = self.config.n_fft
+        hop_length = self.config.hop_length
+
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+
+        stft_result = torch.stft(audio, n_fft=n_fft, hop_length=hop_length,
+                                 window=self._hann_window.to(device), return_complex=True)
+        magnitude = torch.abs(stft_result)
+        phase = torch.angle(stft_result)
+
+        # naive F0 estimation: pick the freq bin with highest mean magnitude
+        avg_mag = magnitude.mean(dim=-1)  # (channels, freq_bins)
+        f0_bin = torch.argmax(avg_mag, dim=-1)
+        freq_bins = torch.linspace(0, self.sample_rate/2, steps=magnitude.size(1), device=device)
+
+        # For each channel, boost the 2nd-4th harmonics of the identified F0 bin
+        for ch in range(audio.size(0)):
+            bin_f0 = f0_bin[ch].item()
+            if bin_f0<1:
+                continue
+            f0_freq = freq_bins[int(bin_f0)].item()
+            if f0_freq>0:
+                for harm_num in range(2,5):
+                    harm_freq = f0_freq*harm_num
+                    # find nearest bin
+                    bin_idx = (torch.abs(freq_bins - harm_freq)).argmin()
+                    if bin_idx.item()<magnitude.size(1):
+                        magnitude[ch, bin_idx, :]*=1.2
+
+        new_stft = magnitude*torch.exp(1j*phase)
+        out_audio = torch.istft(new_stft, n_fft=n_fft, hop_length=hop_length,
+                                window=self._hann_window.to(device))
+        logger.debug("Harmonic reconstruction completed.")
+        return out_audio
 
     def _transient_shaping(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Example stub: Onset detection + envelope manipulation for transients.
+        Placeholder for advanced transient shaping. 
+        Uses onset detection and a small gain boost around onsets.
         """
-        logger.debug("Starting transient shaping (stub).")
-        # Stub logic: no actual shaping
-        logger.debug("Transient shaping completed (no changes).")
-        return audio
+        logger.debug("Starting transient shaping (expanded placeholder).")
+        if audio.dim()==1:
+            audio = audio.unsqueeze(0)
+
+        out_audio = audio.clone()
+        for ch in range(audio.size(0)):
+            sig_np = audio[ch].cpu().numpy()
+            onset_frames = librosa.onset.onset_detect(
+                y=sig_np, sr=self.sample_rate, hop_length=self.config.hop_length
+            )
+            onset_samples = librosa.frames_to_samples(onset_frames, hop_length=self.config.hop_length)
+
+            # Example: short attack boost
+            attack_samps = int(0.01*self.sample_rate)  # 10 ms
+            for onset_sample in onset_samples:
+                start = max(0, onset_sample)
+                end = min(audio.size(-1), onset_sample+attack_samps)
+                out_audio[ch, start:end]*=1.2
+
+        logger.debug("Transient shaping completed.")
+        return out_audio
 
     def _spectral_shaping(self, audio: torch.Tensor, stem_name: str) -> torch.Tensor:
         """
-        Example stub: STFT-based frequency gains for EQ or spectral shaping.
+        Placeholder for advanced spectral EQ. 
+        Example: simple tilt or partial param-EQ in the STFT domain.
         """
-        logger.debug(f"Starting spectral shaping for '{stem_name}' (stub).")
-        # Stub logic: no actual EQ
-        logger.debug(f"Spectral shaping for '{stem_name}' completed (no changes).")
-        return audio
+        logger.debug(f"Starting spectral shaping for '{stem_name}' (expanded placeholder).")
+        n_fft = self.config.n_fft
+        hop_length = self.config.hop_length
+        if audio.dim()==1:
+            audio = audio.unsqueeze(0)
+
+        out_audio = torch.zeros_like(audio)
+        freq_lin = torch.linspace(0, self.sample_rate/2, steps=n_fft//2+1, device=device)
+
+        for ch in range(audio.size(0)):
+            stft_c = torch.stft(audio[ch], n_fft=n_fft, hop_length=hop_length,
+                                window=self._hann_window.to(device), return_complex=True)
+            mag = torch.abs(stft_c)
+            phs = torch.angle(stft_c)
+
+            # Simple tilt from 0.8 at low freq to 1.2 at high freq
+            tilt_curve = torch.linspace(0.8, 1.2, steps=mag.size(0), device=device).unsqueeze(-1)
+            new_mag = mag*tilt_curve
+            new_stft = new_mag*torch.exp(1j*phs)
+            out_audio[ch] = torch.istft(new_stft, n_fft=n_fft, hop_length=hop_length,
+                                        window=self._hann_window.to(device))
+        logger.debug(f"Spectral shaping for '{stem_name}' completed.")
+        return out_audio
 
     def _phase_iterative(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Example stub: Iterative phase refinement (e.g., Griffin-Lim).
+        Placeholder for iterative phase approach (similar to Griffin-Lim).
         """
-        logger.debug("Performing iterative phase approach (stub), no changes.")
-        return audio
+        logger.debug("Starting iterative phase approach (expanded placeholder).")
+        n_fft = self.config.n_fft
+        hop_length = self.config.hop_length
+        n_iter = 5
 
-    ###########################################################################
-    # Vectorized Single-band DRC & Lookahead Limiter
-    ###########################################################################
-    def dynamic_range_compression_vectorized(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized single-band DRC using RMS envelope approach.
-        """
         if audio.dim()==1:
             audio = audio.unsqueeze(0)
-        atk_ms = self.config.comp_attack_ms
-        rls_ms = self.config.comp_release_ms
-        thr_db = self.config.comp_threshold
-        ratio_ = self.config.comp_ratio
-        knee_db = self.config.comp_knee_db
-        makeup_db = self.config.comp_makeup_gain_db
 
-        window_size = int(0.05*self.sample_rate)  # 50 ms
-        window_size = max(window_size,1)
-        window = torch.ones(window_size, device=device)/window_size
+        out_audio = torch.zeros_like(audio)
+        for ch in range(audio.size(0)):
+            stft_c = torch.stft(audio[ch], n_fft=n_fft, hop_length=hop_length,
+                                window=self._hann_window.to(device), return_complex=True)
+            mag = torch.abs(stft_c)
+            phase_est = torch.exp(1j*torch.rand_like(stft_c))  # random initial phase
 
-        sq_data = audio**2
-        pad_sq = torch.nn.functional.pad(sq_data, (window_size//2, window_size//2))
-        conv_out = torch.nn.functional.conv1d(
-            pad_sq.unsqueeze(0), window.unsqueeze(0).unsqueeze(0), padding=0
-        ).squeeze(0)[...,:audio.size(-1)]
-        rms = torch.sqrt(torch.clamp(conv_out, min=1e-10))
-        env_db = 20.0*torch.log10(rms+1e-8)
-        diff_db = torch.clamp(env_db - thr_db, min=0.0)
-        knee_mask = (diff_db<knee_db)
-        gain_db = torch.zeros_like(diff_db)
-        gain_db[knee_mask] = - (diff_db[knee_mask]**2)/(2.0*knee_db)
-        big_mask = (~knee_mask)
-        gain_db[big_mask] = -(diff_db[big_mask]*(1.0-1.0/ratio_))
+            for _ in range(n_iter):
+                recon = torch.istft(mag*torch.exp(1j*torch.angle(phase_est)),
+                                    n_fft=n_fft, hop_length=hop_length,
+                                    window=self._hann_window.to(device))
+                recon_stft = torch.stft(recon, n_fft=n_fft, hop_length=hop_length,
+                                        window=self._hann_window.to(device), return_complex=True)
+                # enforce original magnitude
+                phase_est = recon_stft
 
-        gain_lin = 10.0**(gain_db/20.0)
-        audio_out = audio*gain_lin
-        mk_lin = 10.0**(makeup_db/20.0)
-        audio_out*=mk_lin
-        return audio_out
-
-    def lookahead_limit_vectorized(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized lookahead limiter with naive approach.
-        """
-        if audio.dim()==1:
-            audio = audio.unsqueeze(0)
-        la_ms = 5.0
-        la_samps = int(la_ms*self.sample_rate/1000.0)
-        la_samps = max(la_samps,1)
-        thr_db = self.config.limiter_threshold
-        ratio_ = self.config.limiter_ratio
-
-        pad_aud = torch.nn.functional.pad(audio, (la_samps,0))  # shift for lookahead
-        pad_aud = pad_aud[...,:audio.size(-1)]
-        wsize = int(0.02*self.sample_rate)
-        wsize = max(wsize,1)
-        w = torch.ones(wsize, device=device)/wsize
-        pad_sq = torch.nn.functional.pad(pad_aud**2, (wsize//2,wsize//2))
-        conv_out = torch.nn.functional.conv1d(
-            pad_sq.unsqueeze(0), w.unsqueeze(0).unsqueeze(0), padding=0
-        ).squeeze(0)[...,:audio.size(-1)]
-        env = torch.sqrt(torch.clamp(conv_out, min=1e-10))
-        env_db = 20.0*torch.log10(env+1e-8)
-        diff_db = torch.clamp(env_db-thr_db, min=0.0)
-        gain_db = -diff_db*(1.0-1.0/ratio_)
-        gain_lin = 10.0**(gain_db/20.0)
-        return audio*gain_lin
-
-    def adaptive_spatial_compression(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Placeholder for adaptive spatial compression. 
-        Currently calls dynamic_range_compression_vectorized for demonstration.
-        """
-        return self.dynamic_range_compression_vectorized(audio)
+            out_audio[ch] = torch.istft(mag*torch.exp(1j*torch.angle(phase_est)),
+                                        n_fft=n_fft, hop_length=hop_length,
+                                        window=self._hann_window.to(device))
+        logger.debug("Iterative phase approach completed.")
+        return out_audio
 
     ###########################################################################
-    # Psychoacoustic Masking & VBAP
+    # Psychoacoustic Masking & Basic Gains
     ###########################################################################
-    def map_centroid_to_pan_2d(self, centroid: float) -> torch.Tensor:
-        low, high = self.config.centroid_low, self.config.centroid_high
-        if high<=low:
-            logger.warning("Invalid centroid range, defaulting to center.")
-            return torch.tensor([0.0,0.0], device=device)
-        norm_val = (centroid-low)/(high-low)
-        norm_val = min(max(norm_val,0.0),1.0)
-
-        if self.config.panning.mapping_function=='logarithmic':
-            norm_val = np.log10(1+9*norm_val)
-        elif self.config.panning.mapping_function=='exponential':
-            norm_val = norm_val**1.5
-        x_val = 2*norm_val-1.0
-        return torch.tensor([x_val,0.0], device=device)
-
-    def vbap_spatialization(self, stem: torch.Tensor, channels: List[int], pan_position: torch.Tensor) -> torch.Tensor:
-        """
-        Demonstrates advanced 2D VBAP with Delaunay-based approach.
-        Falls back to simpler cos² panning if out of hull.
-        """
-        out_ch = max(self.config.speaker_layout_config.layout.keys())+1
-        result = torch.zeros((out_ch, stem.size(-1)), device=device)
-        if stem.dim()==1:
-            stem = stem.unsqueeze(0)
-
-        import numpy as np
-        from scipy.spatial import Delaunay
-        speaker_positions = np.array(list(self.config.speaker_layout_config.layout.values()))
-        speaker_channels = np.array(list(self.config.speaker_layout_config.layout.keys()))
-        tri = Delaunay(speaker_positions)
-        src_xy = pan_position.cpu().numpy()
-        simplex_index = tri.find_simplex(src_xy)
-
-        if simplex_index!=-1:
-            # Found valid triangle
-            triangle_indices = tri.simplices[simplex_index]
-            active_channels = speaker_channels[triangle_indices]
-            active_positions= speaker_positions[triangle_indices]
-
-            # Barycentric gains
-            import numpy.linalg
-            A = np.concatenate((active_positions, np.ones((3,1))), axis=1)
-            b = np.array([src_xy[0], src_xy[1], 1.0])
-            try:
-                # Using lstsq for a robust approach
-                gains, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-                gains = np.clip(gains[:3],0.0,1.0)
-                s = gains.sum()
-                if s>1e-8:
-                    gains /= s
-            except np.linalg.LinAlgError:
-                logger.warning("VBAP: Singularity encountered, fallback to cos^2 panning.")
-                return self._simple_vbap_fallback(stem, channels, pan_position)
-
-            if stem.size(0)==2:
-                for i, chan_idx in enumerate(active_channels):
-                    result[chan_idx]+=stem[0]*gains[i]+stem[1]*gains[i]
-            else:
-                for i, chan_idx in enumerate(active_channels):
-                    result[chan_idx]+=stem[0]*gains[i]
-        else:
-            # fallback
-            result = self._simple_vbap_fallback(stem, channels, pan_position)
-        return result
-
-    def _simple_vbap_fallback(self, stem: torch.Tensor, channels: List[int], pan_position: torch.Tensor) -> torch.Tensor:
-        """
-        Fallback to simpler cos^2 panning if Delaunay approach fails or out of hull.
-        """
-        import numpy as np
-        out_ch = max(self.config.speaker_layout_config.layout.keys())+1
-        result = torch.zeros((out_ch, stem.size(-1)), device=device)
-        if stem.dim()==1:
-            stem = stem.unsqueeze(0)
-
-        src_angle = float(np.arctan2(pan_position[1].item(), pan_position[0].item()))
-        for ch in channels:
-            sp_xy = self.config.speaker_layout_config.layout.get(ch, [0.0,0.0])
-            sp_ang = float(np.arctan2(sp_xy[1], sp_xy[0]))
-            diff = sp_ang - src_angle
-            diff = (diff+np.pi)%(2*np.pi)-np.pi
-            gain = max(0.0,(np.cos(diff))**2)
-            if stem.size(0)==2:
-                result[ch]+=stem[0]*gain+stem[1]*gain
-            else:
-                result[ch]+=stem[0]*gain
-        return result
-
     def apply_psychoacoustic_masking(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Minimal freq gating approach. 
-        For advanced usage, incorporate nussl or custom logic.
-        """
         mask_db = -10.0*self.config.mask_loudness_adjust
         mask_amp = 10.0**(mask_db/20.0)
 
@@ -705,8 +626,7 @@ class PsychoacousticUpmixer:
             fft_c = torch.fft.rfft(sig)
             mag = fft_c.abs()
             thr = mag.mean()*mask_amp
-            gate_mask = (mag>thr).float()
-            return torch.fft.irfft(fft_c*gate_mask, n=sig.size(-1))
+            return torch.fft.irfft(fft_c*(mag>thr), n=sig.size(-1))
 
         if audio.dim()==1:
             return freq_gate(audio)
@@ -716,31 +636,130 @@ class PsychoacousticUpmixer:
         return torch.stack(outs, dim=0)
 
     ###########################################################################
+    # Stereo Width
+    ###########################################################################
+    def apply_stereo_width(self, audio: torch.Tensor, width: float) -> torch.Tensor:
+        mid = 0.5*(audio[0]+audio[1])
+        side= 0.5*(audio[0]-audio[1])*width
+        left = mid+side
+        right= mid-side
+        return torch.stack([left,right],dim=0)
+
+    ###########################################################################
+    # Mapping Spectral Centroid => 2D Pan Position
+    ###########################################################################
+    def map_centroid_to_pan_2d(self, centroid: float) -> torch.Tensor:
+        """
+        Maps spectral centroid -> 2D pan position using config's mapping_function & spread.
+        """
+        if self.config.centroid_high<=self.config.centroid_low:
+            logger.warning("Invalid centroid range, returning center position.")
+            return torch.tensor([0.0,0.0], device=device)
+
+        norm_val = (centroid - self.config.centroid_low)/(self.config.centroid_high-self.config.centroid_low)
+        norm_val = torch.clamp(torch.tensor(norm_val, device=device), 0.0, 1.0)
+        if self.config.panning.mapping_function=='logarithmic':
+            norm_val = torch.log1p(norm_val*(math.e-1))
+        elif self.config.panning.mapping_function=='exponential':
+            norm_val = norm_val**2
+
+        x = (norm_val*2.0 -1.0)*self.config.panning.spread
+        y = 0.0
+        return torch.tensor([x,y], device=device)
+
+    ###########################################################################
+    # Advanced VBAP
+    ###########################################################################
+    def vbap_spatialization(self, stem: torch.Tensor, channels: List[int], pan_position: torch.Tensor) -> torch.Tensor:
+        """
+        Example advanced VBAP using Delaunay triangulation for speaker layout.
+        Falls back if outside hull.
+        """
+        if not channels:
+            return stem
+        sp_layout = self.config.speaker_layout_config.layout
+        out_ch = max(sp_layout.keys())+1
+        result = torch.zeros((out_ch, stem.size(-1)), device=device)
+        if stem.dim()==1:
+            stem = stem.unsqueeze(0)
+
+        speaker_positions = []
+        speaker_indices = []
+        for c in channels:
+            if c in sp_layout:
+                speaker_positions.append(sp_layout[c])
+                speaker_indices.append(c)
+
+        if len(speaker_positions)<3:
+            logger.warning("Not enough speakers for advanced VBAP. Falling back.")
+            mean_stem = stem.mean(dim=0) if stem.dim()==2 else stem
+            for c in speaker_indices:
+                result[c,:mean_stem.size(-1)]+=mean_stem
+            return result
+
+        coords = np.array(speaker_positions)
+        try:
+            tri = Delaunay(coords)
+            pt = np.array([pan_position[0].item(), pan_position[1].item()])
+            simplex_idx = tri.find_simplex(pt)
+            if simplex_idx==-1:
+                logger.warning("Pan position outside speaker hull, fallback to amplitude panning.")
+                mean_stem = stem.mean(dim=0) if stem.dim()==2 else stem
+                for c in speaker_indices:
+                    result[c,:mean_stem.size(-1)]+=mean_stem
+                return result
+            else:
+                triangle = tri.simplices[simplex_idx]
+                A = np.concatenate((coords[triangle], np.ones((3,1))), axis=1)
+                b = np.array([pt[0], pt[1],1.0])
+                x_sol, _, _, _= np.linalg.lstsq(A, b, rcond=None)
+                x_sol[x_sol<0]=0
+                if x_sol.sum()>0:
+                    x_sol/=x_sol.sum()
+
+                if stem.dim()==2 and stem.size(0)==2:
+                    for i, sp_idx in enumerate(triangle):
+                        cchan = speaker_indices[sp_idx]
+                        result[cchan,:stem.size(-1)] += stem[0]*x_sol[i]+stem[1]*x_sol[i]
+                else:
+                    for i, sp_idx in enumerate(triangle):
+                        cchan = speaker_indices[sp_idx]
+                        result[cchan,:stem.size(-1)] += stem[0]*x_sol[i]
+        except Exception as e:
+            logger.error(f"VBAP triangulation error: {e}")
+            mean_stem = stem.mean(dim=0) if stem.dim()==2 else stem
+            for c in speaker_indices:
+                result[c,:mean_stem.size(-1)] += mean_stem
+        return result
+
+    ###########################################################################
     # Multi-band Decorrelation & Reverb
     ###########################################################################
     def multi_band_decorrelation(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Simple multi-band approach with fixed freq edges and small time delay 
-        to decorrelate channels.
+        to decorrelate. CPU-based with sosfiltfilt for demonstration.
         """
-        if audio.dim()==1: return audio
+        if audio.dim()==1:
+            return audio
         freq_edges = [0,2000,6000,20000]
         out_sig = torch.zeros_like(audio)
         for i in range(3):
             low, high = freq_edges[i], freq_edges[i+1]
-            sos = butter(4, [low,high], btype='band', fs=self.sample_rate, output='sos')
-            band_np = sosfiltfilt(sos, audio.cpu().numpy(), axis=1)
-            band_t = torch.from_numpy(band_np).to(device)
-            delay_samps = 20
-            band_delayed = torch.roll(band_t, shifts=delay_samps, dims=-1)
-            mix_ratio = 0.5
-            out_sig += band_t*(1-mix_ratio)+band_delayed*mix_ratio
+            try:
+                sos = butter(4, [low,high], btype='band', fs=self.sample_rate, output='sos')
+                band_np = sosfiltfilt(sos, audio.cpu().numpy(), axis=1)
+                band_t = torch.from_numpy(band_np).to(device)
+                delay_samps = 20
+                band_delayed = torch.roll(band_t, shifts=delay_samps, dims=-1)
+                mix_ratio = 0.5
+                out_sig += band_t*(1-mix_ratio)+band_delayed*mix_ratio
+            except Exception as e:
+                logger.error(f"Decorrelation band {i} error: {e}")
+                out_sig += audio
         return out_sig
 
     def add_early_reflections(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Simple reverb IR-based convolution.
-        """
         if self.reverb_ir is None:
             return audio
         wet, dry = self.config.reverb.wet_level, self.config.reverb.dry_level
@@ -773,68 +792,113 @@ class PsychoacousticUpmixer:
             return torch.stack(outs, dim=0)
 
     ###########################################################################
-    # Vectorized Multi-Band Compression
+    # Multi-band Compression (Vectorized Stub)
     ###########################################################################
     def apply_multiband_compression_vectorized(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized approach for multi-band compression.
-        Filter design is CPU-based (scipy.signal), but compression is vectorized.
-        """
-        if audio.dim()==1:
-            audio = audio.unsqueeze(0)
         mb_cfg = self.config.multiband_compression
         if not mb_cfg.enabled:
             return audio
+        logger.debug("Starting multi-band compression (expanded stub).")
+        freq_edges = np.logspace(math.log10(20), math.log10(self.sample_rate/2), mb_cfg.bands+1)
+        n_fft = self.config.n_fft
+        hop_length = self.config.hop_length
+        window = self._hann_window.to(device)
 
-        import math
-        freq_edges = np.logspace(math.log10(20), math.log10(20000), mb_cfg.bands+1)
-        out_signal = torch.zeros_like(audio)
-
-        for i, comp_data in enumerate(self.multiband_compressors):
-            thr_db = comp_data['threshold_db']
-            ratio_ = comp_data['ratio']
-            atk_   = comp_data['attack_ms']
-            rls_   = comp_data['release_ms']
-
-            low_hz, high_hz = freq_edges[i], freq_edges[i+1]
-            try:
-                sos = butter(mb_cfg.filter_order, [low_hz, high_hz], btype='band',
-                             fs=self.sample_rate, output='sos')
-                band_np = sosfiltfilt(sos, audio.cpu().numpy(), axis=1)
-                band_t = torch.from_numpy(band_np).to(device)
-                band_comp = self.dynamic_range_compression_vectorized_individual(
-                    band_t, thr_db, ratio_, atk_, rls_, self.config.comp_knee_db
-                )
-                out_signal += band_comp
-            except Exception as e:
-                logger.error(f"Multi-band filter error band{i}: {e}")
-                out_signal += audio
-        return out_signal
-
-    def dynamic_range_compression_vectorized_individual(self, audio: torch.Tensor,
-        threshold_db: float, ratio: float, attack_ms: float, release_ms: float, knee_db: float) -> torch.Tensor:
-        """
-        Vectorized approach for single-band compression with RMS envelope.
-        """
         if audio.dim()==1:
             audio = audio.unsqueeze(0)
+
+        stft = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, return_complex=True, window=window)
+        mag = torch.abs(stft)
+        phs = torch.angle(stft)
+        freq_bin_vals = torch.linspace(0, self.sample_rate/2, steps=mag.size(1), device=device)
+
+        for bidx, comp_data in enumerate(self.multiband_compressors):
+            if bidx>=len(freq_edges)-1:
+                continue
+            low_hz, high_hz = freq_edges[bidx], freq_edges[bidx+1]
+            thr_db = comp_data['threshold_db']
+            ratio_ = comp_data['ratio']
+
+            band_mask = (freq_bin_vals>=low_hz) & (freq_bin_vals<high_hz)
+            band_mag = mag[:, band_mask, :]
+
+            env_db = 20.0*torch.log10(band_mag+1e-8)
+            diff_db= torch.clamp(env_db - thr_db, min=0.0)
+            gain_db= -(diff_db*(1.0-1.0/ratio_))
+            gain_lin= 10.0**(gain_db/20.0)
+            band_mag*=gain_lin
+
+        new_stft = mag*torch.exp(1j*phs)
+        out_audio = torch.istft(new_stft, n_fft=n_fft, hop_length=hop_length, window=window)
+        logger.debug("Multi-band compression completed.")
+        return out_audio
+
+    ###########################################################################
+    # Single-Band DRC & Lookahead Limiter (Vectorized)
+    ###########################################################################
+    def dynamic_range_compression_vectorized(self, audio: torch.Tensor) -> torch.Tensor:
+        if audio.dim()==1:
+            audio = audio.unsqueeze(0)
+        atk_ms = self.config.comp_attack_ms
+        rls_ms = self.config.comp_release_ms
+        thr_db = self.config.comp_threshold
+        ratio_ = self.config.comp_ratio
+        knee_db = self.config.comp_knee_db
+        makeup_db = self.config.comp_makeup_gain_db
+
         window_size = int(0.05*self.sample_rate)
         window_size = max(window_size,1)
         window = torch.ones(window_size, device=device)/window_size
-        pad_sq = torch.nn.functional.pad(audio**2, (window_size//2, window_size//2))
+
+        sq_data = audio**2
+        pad_sq = torch.nn.functional.pad(sq_data, (window_size//2, window_size//2))
         conv_out = torch.nn.functional.conv1d(
             pad_sq.unsqueeze(0), window.unsqueeze(0).unsqueeze(0), padding=0
         ).squeeze(0)[...,:audio.size(-1)]
         rms = torch.sqrt(torch.clamp(conv_out, min=1e-10))
         env_db = 20.0*torch.log10(rms+1e-8)
-        diff_db = torch.clamp(env_db - threshold_db, min=0.0)
+        diff_db = torch.clamp(env_db-thr_db, min=0.0)
         knee_mask = (diff_db<knee_db)
         gain_db = torch.zeros_like(diff_db)
-        gain_db[knee_mask] = - (diff_db[knee_mask]**2)/(2.0*knee_db)
-        big_mask = (~knee_mask)
-        gain_db[big_mask] = -(diff_db[big_mask]*(1.0-1.0/ratio))
+        gain_db[knee_mask] = - ((diff_db[knee_mask]**2)/(2.0*knee_db))
+        gain_db[~knee_mask] = - diff_db[~knee_mask]*(1.0-1.0/ratio_)
         gain_lin = 10.0**(gain_db/20.0)
+        audio_out = audio*gain_lin
+        mk_lin= 10.0**(makeup_db/20.0)
+        audio_out*=mk_lin
+        return audio_out
+
+    def lookahead_limit_vectorized(self, audio: torch.Tensor) -> torch.Tensor:
+        if audio.dim()==1:
+            audio = audio.unsqueeze(0)
+        la_ms = 5.0
+        la_samps = int(la_ms*self.sample_rate/1000.0)
+        la_samps = max(la_samps,1)
+        thr_db = self.config.limiter_threshold
+        ratio_ = self.config.limiter_ratio
+
+        pad_aud = torch.nn.functional.pad(audio, (la_samps,0))
+        pad_aud = pad_aud[...,:audio.size(-1)]
+        wsize = int(0.02*self.sample_rate)
+        wsize = max(wsize,1)
+        w = torch.ones(wsize, device=device)/wsize
+        pad_sq = torch.nn.functional.pad(pad_aud**2, (wsize//2,wsize//2))
+        conv_out = torch.nn.functional.conv1d(
+            pad_sq.unsqueeze(0), w.unsqueeze(0).unsqueeze(0), padding=0
+        ).squeeze(0)[...,:audio.size(-1)]
+        env = torch.sqrt(torch.clamp(conv_out, min=1e-10))
+        env_db = 20.0*torch.log10(env+1e-8)
+        diff_db = torch.clamp(env_db-thr_db, min=0.0)
+        gain_db = -diff_db*(1.0-1.0/ratio_)
+        gain_lin= 10.0**(gain_db/20.0)
         return audio*gain_lin
+
+    def adaptive_spatial_compression(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Placeholder for adaptive spatial compression. 
+        Currently calls single-band compression vectorized for demonstration.
+        """
+        return self.dynamic_range_compression_vectorized(audio)
 
     ###########################################################################
     # Summation & Clipping
@@ -864,28 +928,24 @@ class PsychoacousticUpmixer:
         return audio
 
     ###########################################################################
-    # Additional Steps: Loudness, Phase, etc.
+    # Loudness Normalization
     ###########################################################################
     def normalize_stem_loudness(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Basic loudness normalization to self.target_loudness LUFS.
-        Summation approach for multi-channel.
-        """
         if audio.dim()==1:
             audio_np = audio.cpu().numpy()
             loudness = self.meter.integrated_loudness(audio_np)
-            loud_diff = self.target_loudness - loudness
-            gain_lin = 10.0**(loud_diff/20.0)
+            diff = self.target_loudness - loudness
+            gain_lin = 10.0**(diff/20.0)
             return audio*gain_lin
         else:
             mixed = audio.mean(dim=0).cpu().numpy()
             loudness = self.meter.integrated_loudness(mixed)
-            loud_diff = self.target_loudness - loudness
-            gain_lin = 10.0**(loud_diff/20.0)
+            diff = self.target_loudness - loudness
+            gain_lin = 10.0**(diff/20.0)
             return audio*gain_lin
 
     ###########################################################################
-    # Plugin loading
+    # Plugin Loading
     ###########################################################################
     def load_plugins(self, plugins_dir:str='plugins'):
         if not os.path.isdir(plugins_dir):
@@ -913,41 +973,25 @@ class PsychoacousticUpmixer:
                 logger.error(f"Failed loading plugin from '{pyf}': {e}")
 
     ###########################################################################
-    # Additional Stubs for expansions
+    # Public stubs if needed
     ###########################################################################
     def harmonic_reconstruction(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Example advanced approach for harmonic reconstruction, 
-        replacing or improving the stub.
-        """
         return self._harmonic_reconstruction(audio)
 
     def transient_shaping(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Example advanced approach for transient shaping,
-        replacing or improving the stub.
-        """
         return self._transient_shaping(audio)
 
     def spectral_eq(self, audio: torch.Tensor, stem_name: str) -> torch.Tensor:
-        """
-        Example advanced approach for spectral EQ, 
-        replacing or improving the stub.
-        """
         return self._spectral_shaping(audio, stem_name)
 
     def iterative_phase_approach(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Example advanced approach for iterative phase improvement,
-        replacing or improving the stub.
-        """
         return self._phase_iterative(audio)
 
 ###############################################################################
 # CLI
 ###############################################################################
 def main():
-    parser = argparse.ArgumentParser(description="Vectorized Psychoacoustic Upmixer with Extended Placeholders")
+    parser = argparse.ArgumentParser(description="Advanced Vectorized Psychoacoustic Upmixer (Expanded Placeholders)")
     parser.add_argument('--config_file', type=str, help="Config path (YAML/JSON)")
     parser.add_argument('--sample_rate', type=int, default=44100, help="Sample rate.")
     parser.add_argument('--hrtf_path', type=str, default=None, help="External HRTF path.")
@@ -964,7 +1008,6 @@ def main():
         for kv in args.params:
             if '=' in kv:
                 k,v = kv.split('=',1)
-                # attempt cast
                 try:
                     if '.' in v:
                         override_dict[k] = float(v)
@@ -990,8 +1033,8 @@ def main():
         if not args.stems:
             raise FileLoadingError("No stems provided. Use --stems to specify input files.")
 
-        stms, sr = upm.load_stems(args.stems)
-        final_mix = upm.psychoacoustic_upmix_stems(stms)
+        stems, sr = upm.load_stems(args.stems)
+        final_mix = upm.psychoacoustic_upmix_stems(stems)
 
         if args.plot_analysis:
             import matplotlib.pyplot as plt
